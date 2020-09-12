@@ -18,7 +18,7 @@ parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--evaluate', action='store_true')
 parser.add_argument('--num_epochs', default=200, type=int)
 parser.add_argument('--print_freq', default=50, type=int)
-parser.add_argument('--lr', default=0.0001, type=float)
+parser.add_argument('--lr', default=0.001, type=float)
 parser.add_argument('--momentum', default=0.9, type=float)
 parser.add_argument('--weight_decay', default=0.0001, type=float)
 
@@ -51,27 +51,20 @@ def kd():
     # Load teacher (pretrained)
     teacher = resnet56()
     modify_properly(teacher, args.pretrained)
-    teacher.cuda()
+    teacher = teacher.cuda()
 
-    # Make student
-    student = resnet20()
-    student.cuda()
+    student = resnet20().cuda()
 
-    t_embedding = TEmbedding().cuda()
-    s_embedding = SEmbedding().cuda()
+    encoder = Encoder().cuda()
 
     criterion = {
-        'ce_loss': nn.CrossEntropyLoss().cuda(),
-        'ct_loss': ContrastiveLoss()}
+        'ce': nn.CrossEntropyLoss().cuda(),
+        'mse': nn.MSELoss(reduction='mean').cuda()}
 
-    params = list(student.parameters()) + list(t_embedding.parameters()) + list(s_embedding.parameters())
+    params = list(student.parameters()) + list(encoder.parameters())
     optimizer = torch.optim.Adam(params, lr=args.lr)
 
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75, 150])
-
-    # Evaluate teacher
-    #if args.evaluate:
-        #validate(teacher, val_loader, criterion)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150])
 
     min_val_prec = 0.0
     logger = {
@@ -82,7 +75,8 @@ def kd():
 
     for epoch in range(args.num_epochs):
         # training
-        tr_logger = train(train_loader, student, teacher, s_embedding, t_embedding, criterion, optimizer, epoch)
+        tr_logger = train(
+            train_loader, student, teacher, encoder, criterion, optimizer, epoch)
 
         # validating
         val_logger = validate(val_loader, student, criterion)
@@ -103,7 +97,7 @@ def kd():
     save_log(logger, 'logs/cwfd-resnet20.log')
 
 
-def train(train_loader, student, teacher, s_embedding, t_embedding, criterion, optimizer, epoch):
+def train(train_loader, student, teacher, encoder, criterion, optimizer, epoch):
     logger = {
         'loss': Logger(),
         'prec': Logger()
@@ -111,8 +105,7 @@ def train(train_loader, student, teacher, s_embedding, t_embedding, criterion, o
 
     teacher.eval()
     student.train()
-    s_embedding.train()
-    t_embedding.train()
+    encoder.train()
 
     for step, (images, labels) in enumerate(train_loader):
         images = images.cuda()
@@ -122,16 +115,12 @@ def train(train_loader, student, teacher, s_embedding, t_embedding, criterion, o
         with torch.no_grad():
             _, fmt = teacher(images)
 
-        with torch.no_grad():
-            scores = _get_att_scores(fms, fmt, epoch, step)
-            attended = _get_attended(fmt, scores)  # [128, 64, 64, 8, 8]
+        reps = encoder(fms)
+        rept = encoder(fmt)
 
-        t_embedded = t_embedding(attended)
-        s_embedded = s_embedding(fms)
-
-        ce_loss = criterion['ce_loss'](preds, labels)
-        cwfd_loss = criterion['ct_loss'](s_embedded, t_embedded)
-        loss = ce_loss + cwfd_loss
+        ce_loss = criterion['ce'](preds, labels)
+        fd_loss = criterion['mse'](reps, rept)
+        loss = ce_loss + fd_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -141,10 +130,6 @@ def train(train_loader, student, teacher, s_embedding, t_embedding, criterion, o
 
         logger['loss'].update(loss.cpu().detach().numpy(), images.size(0))
         logger['prec'].update(prec.cpu().detach().numpy(), images.size(0))
-
-        if epoch % 10 == 0:
-            if step != 0 and step % 300 == 0:
-                print(scores[0, 0:10])
 
         if step == 0 or step % args.print_freq == 0:
             print("epochs: {}, steps: {} - loss: {}, accuracy: {}".format(
@@ -173,11 +158,8 @@ def validate(val_loader, model, criterion):
             labels = labels.cuda()
 
             preds, _ = model(images)
-            loss = criterion['ce_loss'](preds, labels)
+            loss = criterion['ce'](preds, labels)
             prec = get_accuracy(preds, labels)
-
-            preds.float()
-            loss.float()
 
             logger['loss'].update(loss.cpu().detach().numpy(), images.size(0))
             logger['prec'].update(prec.cpu().detach().numpy(), images.size(0))
@@ -188,110 +170,60 @@ def validate(val_loader, model, criterion):
     return logger
 
 
-class ContrastiveLoss:
-    def __init__(self):
-        self.inf = 987654321.0
-        self.mask = F.one_hot(torch.arange(64)) * self.inf
-        self.mask = self.mask.expand(128, 64, 64).float().cuda()
-        self.ce_loss = nn.CrossEntropyLoss().cuda()
-        self.target = torch.arange(64).expand(128, 64).contiguous().view(-1).cuda()
-
-    def __call__(self, a, b):
-        # a.shape: [128, 64, 64]
-        # b.shape: [128, 64, 64]
-        batch_size, _, _ = a.size()
-
-        mask = F.one_hot(torch.arange(64)) * self.inf
-        mask = mask.expand(batch_size, 64, 64).float().cuda()
-        ce_loss = nn.CrossEntropyLoss().cuda()
-        target = torch.arange(64).expand(batch_size, 64).contiguous().view(-1).cuda()
-
-        a = a.view(a.size()[0], a.size()[1], -1)
-        b = b.view(b.size()[0], b.size()[1], -1)
-        aa = torch.bmm(a, a.permute(0, 2, 1))
-        aa = aa - mask
-        bb = torch.bmm(b, b.permute(0, 2, 1))
-        bb = bb - mask
-        ab = torch.bmm(a, b.permute(0, 2, 1))
-        ba = torch.bmm(b, a.permute(0, 2, 1))
-        loss_a = ce_loss(
-            torch.cat([ab, aa], dim=2).view(batch_size*64, 128), target)
-        loss_b = ce_loss(
-            torch.cat([ba, bb], dim=2).view(batch_size*64, 128), target)
-        loss = loss_a + loss_b
-        return loss
-
-
-def _weights_init(m):
+def he_init(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
         init.kaiming_normal_(m.weight)
 
 
-class TEmbedding(nn.Module):
+class Encoder(nn.Module):
     def __init__(self):
-        super(TEmbedding, self).__init__()
-        self.fc1 = nn.Linear(8*8*64, 1024, bias=False)
+        super(Encoder, self).__init__()
+        self.fc1 = nn.Linear(4096, 1024, bias=False)
         self.bn1 = nn.BatchNorm1d(1024)
-        self.fc2 = nn.Linear(1024, 256, bias=False)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 64, bias=False)
-        self.bn3 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(1024, 512, bias=False)
+        self.bn2 = nn.BatchNorm1d(512)
+        self.fc3 = nn.Linear(512, 256, bias=False)
+        self.bn3 = nn.BatchNorm1d(256)
 
-        self.apply(_weights_init)
-
-    def forward(self, x):
-        # x.shape: [b, c, c, h, w]
-        batch_size = x.size()[0]
-        x = x.view(x.size()[0], x.size()[1], -1)
-        x = x.view(-1, x.size()[2])
-
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = F.relu(self.bn3(self.fc3(x)))
-
-        x = x.view(batch_size, 64, 64)
-        return x
-
-
-class SEmbedding(nn.Module):
-    def __init__(self):
-        super(SEmbedding, self).__init__()
-        self.fc1 = nn.Linear(8*8, 64, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 64, bias=False)
-        self.bn2 = nn.BatchNorm1d(64)
-
-        self.apply(_weights_init)
+        self.apply(he_init)
 
     def forward(self, x):
         # x.shape: [b, c, h, w]
         batch_size = x.size()[0]
-        x = x.view(batch_size, x.size()[1], -1)
-        x = x.view(batch_size * x.size()[1], -1)
-
+        x = x.view(batch_size, -1)
         x = F.relu(self.bn1(self.fc1(x)))
         x = F.relu(self.bn2(self.fc2(x)))
-
-        x = x.view(batch_size, 64, 64)
+        x = F.relu(self.bn3(self.fc3(x)))
+        # x.shape: [b, 256]
         return x
 
 
-def _get_attended(fmt, scores):
-    b, c, h, w = fmt.size()
-    fmt = fmt.view(b, c, -1).expand(64, b, c, h*w).permute(1, 0, 2, 3)
-    scores = scores.unsqueeze(dim=3)
-    attended = scores * fmt
-    attended = attended.view(b, c, c, h, w)
-    return attended
+class ContrastiveLoss:
+    def __init__(self):
+        self.inf = 987654321.0
+        self.ce_loss = nn.CrossEntropyLoss()
 
+    def __call__(self, a, b):
+        # a.shape: [batch_size, 256]
+        # b.shape: [batch_size, 256]
+        batch_size, feature_size = a.size()
 
-def _get_att_scores(fms, fmt, epoch, step, T=1.0):
-    b, c, h, w = fms.size()
-    scale_factor = math.sqrt(h*w)
-    fms = fms.view(b, c, -1)
-    fmt = fmt.view(b, c, -1)
-    sim = torch.bmm(fms, fmt.permute(0, 2, 1)) / scale_factor
-    return F.softmax(sim/T, dim=2)
+        mask = F.one_hot(torch.arange(batch_size)) * self.inf
+        mask = mask.float().cuda()
+        label = torch.arange(batch_size)
+
+        aa = torch.matmul(a, a.transpose(0, 1))
+        aa = aa - mask
+        bb = torch.matmul(b, b.transpose(0, 1))
+        bb = bb - mask
+        ab = torch.matmul(a, b.transpose(0, 1))
+        ba = torch.matmul(b, a.transpose(0, 1))
+        abaa = torch.cat([ab, aa], dim=1)
+        babb = torch.cat([ba, bb], dim=1)
+        loss_a = self.ce_loss(abaa, label)
+        loss_b = self.ce_loss(babb, label)
+        loss = loss_a + loss_b
+        return loss
 
 
 def save_log(logger, path):
